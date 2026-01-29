@@ -544,16 +544,36 @@ Your role: Extract and structure what was said. Nothing more, nothing less."""
         schema_prompt = """Generate a SOAP note. Respond with ONLY this JSON structure:
 
 {
-  "conversation_summary": "Summary of the consultation flow",
-  "subjective": "Patient-reported information: chief complaint, symptoms, history",
-  "objective": "Clinical findings: vital signs, examination findings",
-  "assessment": "Doctor's assessment: diagnosis, clinical reasoning",
-  "plan": "Treatment plan: medications, follow-up, instructions",
-  "key_insights": "Critical clinical insights and decision rationale",
-  "admin_tasks": ["Tasks needing follow-up"]
+  "conversation_summary": "Brief summary as a single text string",
+  "subjective": "Patient-reported information as a single text string",
+  "objective": "Clinical findings as a single text string (NOT a dictionary)",
+  "assessment": "Diagnosis as a single text string",
+  "plan": "Treatment plan as a single text string (NOT a list)",
+  "key_insights": "Critical insights as a single text string",
+  "admin_tasks": ["task1", "task2"]
 }
 
-Only document what was EXPLICITLY stated. Use empty strings/lists if not discussed."""
+CRITICAL RULES:
+- subjective, objective, assessment, plan, key_insights MUST be text strings
+- Do NOT use nested objects or dictionaries for these fields
+- Only admin_tasks should be an array
+- All other fields are plain text strings
+
+Example of CORRECT format:
+{
+  "subjective": "Patient has headache for 2 days",
+  "objective": "BP 120/80, HR 72, no fever",
+  "assessment": "Tension headache",
+  "plan": "Ibuprofen 400mg as needed, rest, follow up in 1 week"
+}
+
+Example of WRONG format (do NOT do this):
+{
+  "objective": {"vital_signs": {"bp": "120/80"}},
+  "plan": ["Ibuprofen", "Rest"]
+}
+
+Remember: Use simple text strings, not nested structures."""
 
     else:  # prescription
         soap_context_str = ""
@@ -570,8 +590,7 @@ CLINICAL CONTEXT FROM SOAP NOTE:
 Respond with ONLY this JSON structure:
 
 {{
-  "patient_name": "{request.patient_name}",
-  "patient_id": "{request.patient_id}",
+  
   "chief_complaint": "Why patient came in",
   "symptoms": ["List of symptoms"],
   "diagnosis": "Primary diagnosis",
@@ -615,9 +634,27 @@ Transcript:
             supabase = get_supabase_client()
             
             if request.note_type == "soap":
+                 # Ensure required fields are present
+                if 'patient_id' not in note_json:
+                    note_json['patient_id'] = request.patient_id
+                if 'doctor_id' not in note_json:
+                    note_json['doctor_id'] = request.doctor_id
+                if 'visit_type' not in note_json:
+                    note_json['visit_type'] = request.visit_type
+                
+                # Convert dict/list fields to strings
+                if isinstance(note_json.get('subjective'), (dict, list)):
+                    note_json['subjective'] = str(note_json['subjective'])
+                if isinstance(note_json.get('objective'), (dict, list)):
+                    note_json['objective'] = str(note_json['objective'])
+                if isinstance(note_json.get('assessment'), (dict, list)):
+                    note_json['assessment'] = str(note_json['assessment'])
+                if isinstance(note_json.get('plan'), (dict, list)):
+                    note_json['plan'] = str(note_json['plan'])
+                    
                 validated_note = SOAPNote(**note_json)
                 note_data = validated_note.model_dump()
-                
+                            
                 # Save SOAP note to database
                 db_result = supabase.table('soap_notes').insert({
                     "patient_id": request.patient_id,
@@ -639,6 +676,10 @@ Transcript:
                 return {**note_data, "id": note_id, "note_type": "soap"}
             
             else:  # prescription
+                # Ollama doesn't generate these - we provide them
+                note_json['patient_name'] = request.patient_name
+                note_json['patient_id'] = request.patient_id
+                
                 validated_note = PrescriptionNote(**note_json)
                 note_data = validated_note.model_dump()
                 
@@ -687,6 +728,24 @@ Transcript:
             try:
                 note_json = extract_json_from_response(retry_content)
                 if request.note_type == "soap":
+                    # Ensure required fields
+                    if 'patient_id' not in note_json:
+                        note_json['patient_id'] = request.patient_id
+                    if 'doctor_id' not in note_json:
+                        note_json['doctor_id'] = request.doctor_id
+                    if 'visit_type' not in note_json:
+                        note_json['visit_type'] = request.visit_type
+                    
+                    # Convert dict/list fields to strings
+                    if isinstance(note_json.get('subjective'), (dict, list)):
+                        note_json['subjective'] = str(note_json['subjective'])
+                    if isinstance(note_json.get('objective'), (dict, list)):
+                        note_json['objective'] = str(note_json['objective'])
+                    if isinstance(note_json.get('assessment'), (dict, list)):
+                        note_json['assessment'] = str(note_json['assessment'])
+                    if isinstance(note_json.get('plan'), (dict, list)):
+                        note_json['plan'] = str(note_json['plan'])
+                        
                     validated_note = SOAPNote(**note_json)
                     return validated_note.model_dump()
                 else:
