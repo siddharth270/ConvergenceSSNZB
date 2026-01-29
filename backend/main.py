@@ -2,7 +2,8 @@
 AI Medical Scribe MVP - FastAPI Backend
 
 This application provides API endpoints for clinical documentation assistance.
-It converts audio recordings to structured notes using OpenAI's services.
+It converts audio recordings to structured notes using Ollama (Llama 3.2) and local Whisper.
+Data is persisted to Supabase for patient history and record keeping.
 
 IMPORTANT: This tool is for documentation assistance only and does not provide 
 medical diagnosis or treatment recommendations.
@@ -10,20 +11,23 @@ medical diagnosis or treatment recommendations.
 
 import os
 import tempfile
-
 import logging
-from typing import Dict, Any, Optional
+import re
+import uuid
+from typing import Dict, Any, Optional, List
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ValidationError
-import openai
 import json
 from datetime import datetime
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from dotenv import load_dotenv
+import httpx
+
+from supabase_client import get_supabase_client
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -35,7 +39,7 @@ load_dotenv()
 # Initialize FastAPI app
 app = FastAPI(
     title="AI Medical Scribe MVP",
-    description="Clinical documentation assistance API",
+    description="Clinical documentation assistance API with Supabase persistence",
     version="1.0.0"
 )
 
@@ -55,23 +59,94 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize OpenAI client
-openai_api_key = os.getenv("OPENAI_API_KEY")
-if not openai_api_key:
-    raise ValueError("OPENAI_API_KEY environment variable is required")
+# Ollama configuration
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 
-openai_client = openai.OpenAI(api_key=openai_api_key)
+# Whisper model (lazy loaded)
+whisper_model = None
 
 
-# Configure Jinja2 template engine with auto-escaping for security
+def get_whisper_model():
+    """Lazy load Whisper model to save memory on startup"""
+    global whisper_model
+    if whisper_model is None:
+        from faster_whisper import WhisperModel
+        model_size = os.getenv("WHISPER_MODEL_SIZE", "base")
+        device = os.getenv("WHISPER_DEVICE", "cpu")
+        compute_type = "int8" if device == "cpu" else "float16"
+        
+        logger.info(f"Loading Whisper model: {model_size} on {device}")
+        whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        logger.info("Whisper model loaded successfully")
+    return whisper_model
+
+
+async def call_ollama(messages: list, temperature: float = 0.1) -> str:
+    """Call Ollama API for chat completion."""
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        try:
+            response = await client.post(
+                f"{OLLAMA_BASE_URL}/api/chat",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "messages": messages,
+                    "stream": False,
+                    "options": {
+                        "temperature": temperature,
+                        "num_predict": 4000,
+                    },
+                    "format": "json"
+                }
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result["message"]["content"]
+        except httpx.TimeoutException:
+            logger.error("Ollama request timed out")
+            raise HTTPException(status_code=504, detail="AI service timed out. Please try again.")
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Ollama HTTP error: {e}")
+            raise HTTPException(status_code=500, detail=f"AI service error: {str(e)}")
+        except Exception as e:
+            logger.error(f"Ollama error: {e}")
+            raise HTTPException(status_code=500, detail=f"AI service error: {str(e)}")
+
+
+def extract_json_from_response(text: str) -> dict:
+    """Extract JSON from LLM response, handling markdown code blocks."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    
+    json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
+    if json_match:
+        try:
+            return json.loads(json_match.group(1))
+        except json.JSONDecodeError:
+            pass
+    
+    json_match = re.search(r'\{[\s\S]*\}', text)
+    if json_match:
+        try:
+            return json.loads(json_match.group(0))
+        except json.JSONDecodeError:
+            pass
+    
+    raise ValueError(f"Could not extract valid JSON from response: {text[:500]}...")
+
+
+# Configure Jinja2 template engine
 templates_dir = Path(__file__).parent / "templates"
 jinja_env = Environment(
     loader=FileSystemLoader(templates_dir),
-    autoescape=select_autoescape(['html', 'xml'])  # Auto-escape for security
+    autoescape=select_autoescape(['html', 'xml'])
 )
 
 
-# Pydantic models for API requests and responses
+# ============== Pydantic Models ==============
+
 class SummarizeRequest(BaseModel):
     """Request model for note summarization endpoint."""
     transcript: str
@@ -79,21 +154,23 @@ class SummarizeRequest(BaseModel):
     visit_type: str  # "new", "followup", "repeat"
     patient_name: str
     patient_id: str
-    soap_context: Optional[Dict[str, Any]] = None  # Optional SOAP note context for prescription generation
+    doctor_id: str  # Required for saving to database
+    conversation_id: Optional[str] = None  # Link to existing conversation
+    soap_context: Optional[Dict[str, Any]] = None
 
 
 class Medication(BaseModel):
-    """Model for prescription medications with detailed fields."""
+    """Model for prescription medications."""
     name: str
-    dose: str  # e.g., "500mg", "10ml", "2 tablets"
-    route: str  # e.g., "Oral", "IV", "Topical", "IM"
-    frequency: str  # e.g., "Twice daily", "Every 8 hours", "As needed"
-    duration: str  # e.g., "7 days", "2 weeks", "Ongoing"
-    instructions: str = ""  # e.g., "Take with food", "Before bedtime"
+    dose: str
+    route: str
+    frequency: str
+    duration: str
+    instructions: str = ""
 
 
 class SOAPNote(BaseModel):
-    """Model for enhanced SOAP note structure with conversation summary."""
+    """Model for SOAP note structure."""
     conversation_summary: str
     subjective: str
     objective: str
@@ -104,49 +181,89 @@ class SOAPNote(BaseModel):
 
 
 class PrescriptionNote(BaseModel):
-    """Model for comprehensive prescription note structure."""
+    """Model for prescription note structure."""
     patient_name: str
     patient_id: str
-    chief_complaint: str = ""  # What brought the patient in
-    symptoms: list[str] = []  # List of symptoms mentioned
-    diagnosis: str = ""  # Primary diagnosis or working diagnosis
-    vital_signs: dict = {}  # BP, HR, Temp, SpO2, etc. if mentioned
+    chief_complaint: str = ""
+    symptoms: list[str] = []
+    diagnosis: str = ""
+    vital_signs: dict = {}
     medications: list[Medication]
-    instructions: str = ""  # General patient care instructions
-    warnings: list[str] = []  # Side effects, contraindications, when to seek help
-    follow_up: str = ""  # Follow-up timeline and instructions
+    instructions: str = ""
+    warnings: list[str] = []
+    follow_up: str = ""
 
 
 class RenderRequest(BaseModel):
     """Request model for note rendering endpoint."""
-    note_type: str  # "soap" or "prescription"
-    note_data: Dict[str, Any]  # The structured note JSON
+    note_type: str
+    note_data: Dict[str, Any]
     patient_name: str
     patient_id: str
-    visit_type: str = "followup"  # Optional, defaults to followup
-    doctor_name: str = "Dr. [Your Name]"  # Optional, doctor's name for prescription
+    visit_type: str = "followup"
+    doctor_name: str = "Dr. [Your Name]"
+
+
+class PatientCreate(BaseModel):
+    """Model for creating a new patient."""
+    name: str
+    date_of_birth: Optional[str] = None
+    gender: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    address: Optional[str] = None
+    medical_history: Optional[str] = None
+    allergies: Optional[str] = None
+    current_medications: Optional[str] = None
+
+
+class DoctorCreate(BaseModel):
+    """Model for creating/registering a doctor."""
+    name: str
+    email: str
+    specialty: Optional[str] = None
+    license_number: Optional[str] = None
+    phone: Optional[str] = None
+
+
+# ============== Health & Root Endpoints ==============
 
 @app.get("/health")
 async def health_check() -> Dict[str, str]:
-    """
-    Health check endpoint to verify the API is running.
+    """Health check endpoint."""
+    ollama_status = "unknown"
+    supabase_status = "unknown"
     
-    Returns:
-        Dict with status and service information
-    """
+    # Check Ollama
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
+            ollama_status = "connected" if response.status_code == 200 else "error"
+    except Exception:
+        ollama_status = "disconnected"
+    
+    # Check Supabase
+    try:
+        supabase = get_supabase_client()
+        supabase.table('doctors').select('count').limit(1).execute()
+        supabase_status = "connected"
+    except Exception:
+        supabase_status = "disconnected"
+    
     return {
         "status": "healthy",
         "service": "AI Medical Scribe MVP",
         "version": "1.0.0",
+        "ollama_status": ollama_status,
+        "ollama_model": OLLAMA_MODEL,
+        "supabase_status": supabase_status,
         "disclaimer": "For documentation assistance only - not for medical diagnosis"
     }
 
 
 @app.get("/")
 async def root() -> Dict[str, str]:
-    """
-    Root endpoint with basic API information.
-    """
+    """Root endpoint with API information."""
     return {
         "message": "AI Medical Scribe MVP API",
         "health": "/health",
@@ -154,59 +271,161 @@ async def root() -> Dict[str, str]:
         "disclaimer": "For documentation assistance only - requires clinician review"
     }
 
+
+# ============== Doctor Endpoints ==============
+
+@app.post("/api/doctors")
+async def create_doctor(doctor: DoctorCreate) -> Dict[str, Any]:
+    """Register a new doctor."""
+    try:
+        supabase = get_supabase_client()
+        
+        # Check if doctor with email already exists
+        existing = supabase.table('doctors').select('id').eq('email', doctor.email).execute()
+        if existing.data:
+            raise HTTPException(status_code=400, detail="Doctor with this email already exists")
+        
+        result = supabase.table('doctors').insert({
+            "name": doctor.name,
+            "email": doctor.email,
+            "specialty": doctor.specialty,
+            "license_number": doctor.license_number,
+            "phone": doctor.phone
+        }).execute()
+        
+        logger.info(f"Created doctor: {result.data[0]['id']}")
+        return result.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating doctor: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/doctors/{doctor_id}")
+async def get_doctor(doctor_id: str) -> Dict[str, Any]:
+    """Get doctor by ID."""
+    try:
+        supabase = get_supabase_client()
+        result = supabase.table('doctors').select('*').eq('id', doctor_id).execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Doctor not found")
+        
+        return result.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching doctor: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/doctors")
+async def list_doctors() -> List[Dict[str, Any]]:
+    """List all doctors."""
+    try:
+        supabase = get_supabase_client()
+        result = supabase.table('doctors').select('*').order('name').execute()
+        return result.data
+    except Exception as e:
+        logger.error(f"Error listing doctors: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============== Patient Endpoints ==============
+
+@app.post("/api/patients")
+async def create_patient(patient: PatientCreate, doctor_id: str = Query(...)) -> Dict[str, Any]:
+    """Create a new patient."""
+    try:
+        supabase = get_supabase_client()
+        
+        result = supabase.table('patients').insert({
+            "name": patient.name,
+            "date_of_birth": patient.date_of_birth,
+            "gender": patient.gender,
+            "phone": patient.phone,
+            "email": patient.email,
+            "address": patient.address,
+            "medical_history": patient.medical_history,
+            "allergies": patient.allergies,
+            "current_medications": patient.current_medications,
+            "doctor_id": doctor_id
+        }).execute()
+        
+        logger.info(f"Created patient: {result.data[0]['id']}")
+        return result.data[0]
+    except Exception as e:
+        logger.error(f"Error creating patient: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/patients/{patient_id}")
+async def get_patient(patient_id: str) -> Dict[str, Any]:
+    """Get patient by ID with their history."""
+    try:
+        supabase = get_supabase_client()
+        
+        # Get patient info
+        patient = supabase.table('patients').select('*').eq('id', patient_id).execute()
+        if not patient.data:
+            raise HTTPException(status_code=404, detail="Patient not found")
+        
+        # Get recent SOAP notes
+        soap_notes = supabase.table('soap_notes').select('*').eq('patient_id', patient_id).order('created_at', desc=True).limit(10).execute()
+        
+        # Get recent prescriptions
+        prescriptions = supabase.table('prescriptions').select('*').eq('patient_id', patient_id).order('created_at', desc=True).limit(10).execute()
+        
+        return {
+            **patient.data[0],
+            "recent_soap_notes": soap_notes.data,
+            "recent_prescriptions": prescriptions.data
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching patient: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/patients")
+async def list_patients(doctor_id: str = Query(...)) -> List[Dict[str, Any]]:
+    """List all patients for a doctor."""
+    try:
+        supabase = get_supabase_client()
+        result = supabase.table('patients').select('*').eq('doctor_id', doctor_id).order('name').execute()
+        return result.data
+    except Exception as e:
+        logger.error(f"Error listing patients: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============== Transcription Endpoint ==============
+
 @app.post("/api/transcribe")
-async def transcribe_audio(audio: UploadFile = File(...)) -> Dict[str, str]:
+async def transcribe_audio(
+    audio: UploadFile = File(...),
+    patient_id: str = Form(None),
+    doctor_id: str = Form(None)
+) -> Dict[str, Any]:
     """
-    Transcribe audio file using OpenAI Whisper API.
-    
-    This endpoint:
-    1. Accepts multipart file upload (WebM, MP3, MP4, etc.)
-    2. Validates file size and format
-    3. Saves to temporary storage
-    4. Calls OpenAI Whisper API for transcription
-    5. Cleans up temporary files
-    6. Returns transcript as JSON
-    
-    Args:
-        audio: Audio file from frontend MediaRecorder
-        
-    Returns:
-        Dict containing transcript text
-        
-    Raises:
-        HTTPException: If file is invalid, too large, or transcription fails
+    Transcribe audio file using local Whisper model.
+    Optionally saves conversation to database if patient_id and doctor_id provided.
     """
-    # Validate file size (limit to 25MB as per OpenAI Whisper limits)
-    MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB
+    MAX_FILE_SIZE = 25 * 1024 * 1024
     
-    # Read file content to check size
     audio_content = await audio.read()
     if len(audio_content) > MAX_FILE_SIZE:
-        logger.warning(f"File too large: {len(audio_content)} bytes")
-        raise HTTPException(
-            status_code=413,
-            detail="Audio file too large. Maximum size is 25MB."
-        )
+        raise HTTPException(status_code=413, detail="Audio file too large. Maximum size is 25MB.")
     
-    # Validate file format (check MIME type)
-    allowed_types = [
-        "audio/webm", "audio/mp4", "audio/mpeg", "audio/wav", 
-        "audio/x-wav", "audio/ogg", "video/webm"
-    ]
-    
+    allowed_types = ["audio/webm", "audio/mp4", "audio/mpeg", "audio/wav", "audio/x-wav", "audio/ogg", "video/webm"]
     if audio.content_type not in allowed_types:
-        logger.warning(f"Invalid file type: {audio.content_type}")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported audio format: {audio.content_type}. "
-                   f"Supported formats: WebM, MP4, MP3, WAV, OGG"
-        )
+        raise HTTPException(status_code=400, detail=f"Unsupported audio format: {audio.content_type}")
     
-    # Create temporary file for audio processing
     temp_file = None
     try:
-        # Create temporary file with appropriate extension
-        file_extension = ".webm"  # Default for WebM from MediaRecorder
+        file_extension = ".webm"
         if "mp4" in audio.content_type:
             file_extension = ".mp4"
         elif "mpeg" in audio.content_type:
@@ -216,116 +435,89 @@ async def transcribe_audio(audio: UploadFile = File(...)) -> Dict[str, str]:
         elif "ogg" in audio.content_type:
             file_extension = ".ogg"
             
-        # Create temporary file
-        temp_file = tempfile.NamedTemporaryFile(
-            delete=False, 
-            suffix=file_extension,
-            prefix="scribe_audio_"
-        )
-        
-        # Write audio content to temporary file
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=file_extension, prefix="scribe_audio_")
         temp_file.write(audio_content)
         temp_file.flush()
         temp_file.close()
         
         logger.info(f"Saved audio file: {temp_file.name} ({len(audio_content)} bytes)")
         
-        # Call OpenAI Whisper API for transcription
-        with open(temp_file.name, "rb") as audio_file:
-            logger.info("Calling OpenAI Whisper API for transcription...")
-            
-            transcript_response = openai_client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                response_format="text",  # Return plain text, not JSON
-                language="en"  # Specify English for medical terminology
-            )
-            
-        # Extract transcript text
-        transcript_text = transcript_response.strip()
+        # Transcribe with Whisper
+        logger.info("Transcribing audio with local Whisper model...")
+        model = get_whisper_model()
+        
+        segments, info = model.transcribe(
+            temp_file.name,
+            language="en",
+            beam_size=5,
+            best_of=5,
+            vad_filter=True,
+        )
+        
+        transcript_text = " ".join([segment.text for segment in segments]).strip()
         
         logger.info(f"Transcription successful: {len(transcript_text)} characters")
         
-        # Validate transcript is not empty
         if not transcript_text:
-            raise HTTPException(
-                status_code=400,
-                detail="No speech detected in audio file. Please ensure clear audio recording."
-            )
+            raise HTTPException(status_code=400, detail="No speech detected in audio file.")
+        
+        # Save conversation to database if IDs provided
+        conversation_id = None
+        if patient_id and doctor_id:
+            try:
+                supabase = get_supabase_client()
+                conv_result = supabase.table('conversations').insert({
+                    "patient_id": patient_id,
+                    "doctor_id": doctor_id,
+                    "transcript": transcript_text,
+                    "audio_duration": info.duration
+                }).execute()
+                conversation_id = conv_result.data[0]['id']
+                logger.info(f"Saved conversation: {conversation_id}")
+            except Exception as e:
+                logger.warning(f"Failed to save conversation: {e}")
         
         return {
             "transcript": transcript_text,
             "status": "success",
-            "audio_duration_estimate": f"{len(audio_content) // 16000} seconds"  # Rough estimate
+            "audio_duration": f"{info.duration:.1f} seconds",
+            "conversation_id": conversation_id
         }
         
-    except openai.OpenAIError as e:
-        logger.error(f"OpenAI API error: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Transcription service error: {str(e)}"
-        )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Unexpected error during transcription: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail="Internal server error during transcription"
-        )
+        raise HTTPException(status_code=500, detail=f"Transcription error: {str(e)}")
     finally:
-        # Clean up temporary file
         if temp_file and os.path.exists(temp_file.name):
             try:
                 os.unlink(temp_file.name)
-                logger.info(f"Cleaned up temporary file: {temp_file.name}")
             except Exception as e:
                 logger.warning(f"Failed to clean up temporary file: {e}")
 
 
+# ============== Summarization Endpoint ==============
+
 @app.post("/api/summarize")
 async def summarize_transcript(request: SummarizeRequest) -> Dict[str, Any]:
     """
-    Generate structured clinical note from transcript using OpenAI GPT.
-    
-    This endpoint:
-    1. Validates input data (transcript, patient info, note type)
-    2. Applies medical guardrails via system prompts
-    3. Uses strict JSON schemas for note generation
-    4. Calls OpenAI GPT-4 with json_object response format
-    5. Validates and returns parsed JSON
-    
-    Args:
-        request: SummarizeRequest containing transcript and patient context
-        
-    Returns:
-        Dict containing structured note (SOAP or Prescription format)
-        
-    Raises:
-        HTTPException: If validation fails or AI generation fails
+    Generate structured clinical note from transcript using Ollama.
+    Saves the generated note to Supabase.
     """
-    # Validate input data
     if not request.transcript.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Transcript cannot be empty"
-        )
+        raise HTTPException(status_code=400, detail="Transcript cannot be empty")
     
     if request.note_type not in ["soap", "prescription"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Note type must be 'soap' or 'prescription'"
-        )
+        raise HTTPException(status_code=400, detail="Note type must be 'soap' or 'prescription'")
     
     if request.visit_type not in ["new", "followup", "repeat"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Visit type must be 'new', 'followup', or 'repeat'"
-        )
+        raise HTTPException(status_code=400, detail="Visit type must be 'new', 'followup', or 'repeat'")
     
     logger.info(f"Generating {request.note_type} note for patient {request.patient_id}")
     
-    try:
-        # System prompt with strong anti-hallucination guardrails
-        guardrail_prompt = """You are a clinical documentation assistant for transcription ONLY. 
+    # System prompt with anti-hallucination guardrails
+    guardrail_prompt = """You are a clinical documentation assistant for transcription ONLY. 
 
 🚨 CRITICAL ANTI-HALLUCINATION RULES:
 
@@ -334,390 +526,313 @@ async def summarize_transcript(request: SummarizeRequest) -> Dict[str, Any]:
    - Add standard medical advice not mentioned
    - Suggest diagnoses, treatments, or medications not discussed
    - Fill in missing details with "typical" or "common" information
-   - Make up dosages, frequencies, or durations
 
 2. MISSING INFORMATION PROTOCOL:
    - If a field has NO information in the transcript, leave it as empty string "" or empty list []
-   - Do NOT use placeholder text like "Not specified", "To be determined", "As directed"
-   - For medications: If dose/route/frequency/duration not mentioned, use "" for that field
-   - Better to have incomplete accurate data than complete fabricated data
+   - Do NOT use placeholder text like "Not specified", "To be determined"
 
 3. VERBATIM EXTRACTION:
    - Copy medical terms, medication names, and dosages EXACTLY as stated
-   - If doctor says "amoxicillin 500 three times a day", extract exactly that
    - Do NOT standardize, correct, or modify medical terminology
-   - Do NOT convert units or measurements unless explicitly stated
 
-4. DOCUMENTATION ONLY: You are a transcription tool, not a medical advisor:
-   - Never add clinical recommendations
-   - Never suggest additional tests or treatments
-   - Never provide medical explanations not in the transcript
-
-5. VERIFICATION MINDSET: Before adding ANY information, ask yourself:
-   - "Was this EXPLICITLY stated in the conversation?"
-   - "Am I inferring this from medical knowledge?"
-   - If unsure, LEAVE IT BLANK
+4. OUTPUT FORMAT: You MUST respond with valid JSON only. No explanations, no markdown, just the JSON object.
 
 Your role: Extract and structure what was said. Nothing more, nothing less."""
 
-        # Schema-specific prompts and JSON schemas
-        if request.note_type == "soap":
-            schema_prompt = """Generate a comprehensive SOAP note by extracting ALL clinical information from the transcript.
-
-EXTRACTION CHECKLIST - Document if mentioned:
-✓ Patient's chief complaint and reason for visit
-✓ ALL symptoms with duration, severity, and characteristics
-✓ Medical history, allergies, current medications
-✓ Vital signs (BP, HR, Temp, SpO2, Weight, etc.)
-✓ Physical examination findings
-✓ Doctor's assessment and diagnosis
-✓ ALL medications prescribed with complete details
-✓ Treatment plan and instructions
-✓ Follow-up timeline and instructions
-✓ Any warnings or red flags discussed
-
-Generate this EXACT JSON structure:
+    # Build schema prompt based on note type
+    if request.note_type == "soap":
+        schema_prompt = """Generate a SOAP note. Respond with ONLY this JSON structure:
 
 {
-  "conversation_summary": "Detailed summary capturing the flow of the consultation. Format: 'Doctor: [question/statement] | Patient: [response]' for key exchanges. Include chief complaint, symptom discussion, examination findings, diagnosis explanation, and treatment plan discussion.",
-  
-  "subjective": "PATIENT-REPORTED INFORMATION ONLY:
-- Chief Complaint: [Why patient came in]
-- Symptoms: [All symptoms with onset, duration, severity, aggravating/relieving factors]
-- Medical History: [Relevant past medical history mentioned]
-- Current Medications: [Medications patient is currently taking]
-- Allergies: [Any allergies mentioned]
-- Social/Family History: [If discussed]",
-  
-  "objective": "CLINICAL FINDINGS DOCUMENTED BY DOCTOR:
-- Vital Signs: [BP, HR, RR, Temp, SpO2, Weight - if mentioned]
-- Physical Examination: [All examination findings by system]
-- Lab/Imaging Results: [If discussed]
-- Clinical Observations: [Doctor's objective observations]",
-  
-  "assessment": "DOCTOR'S CLINICAL ASSESSMENT:
-- Primary Diagnosis: [Main diagnosis or working diagnosis]
-- Differential Diagnoses: [Alternative diagnoses considered]
-- Clinical Reasoning: [Doctor's medical analysis and thought process]
-- Severity/Prognosis: [If discussed]",
-  
-  "plan": "TREATMENT PLAN:
-- Medications: [List all medications with dose, route, frequency, duration]
-- Procedures/Interventions: [Any procedures ordered or performed]
-- Lifestyle Modifications: [Diet, exercise, activity restrictions]
-- Follow-up: [When to return, what to monitor]
-- Referrals: [Specialist referrals if mentioned]
-- Patient Education: [Key points discussed with patient]",
-  
-  "key_insights": "Critical clinical insights: Important patterns, red flags, clinical pearls, or decision-making rationale that informed the diagnosis and treatment approach.",
-  
-  "admin_tasks": ["List ONLY information that was discussed but needs follow-up, NOT information that wasn't mentioned at all"]
+  "conversation_summary": "Summary of the consultation flow",
+  "subjective": "Patient-reported information: chief complaint, symptoms, history",
+  "objective": "Clinical findings: vital signs, examination findings",
+  "assessment": "Doctor's assessment: diagnosis, clinical reasoning",
+  "plan": "Treatment plan: medications, follow-up, instructions",
+  "key_insights": "Critical clinical insights and decision rationale",
+  "admin_tasks": ["Tasks needing follow-up"]
 }
 
-CRITICAL: Only document what was EXPLICITLY stated. Use empty sections if information wasn't discussed."""
+Only document what was EXPLICITLY stated. Use empty strings/lists if not discussed."""
 
-            json_schema = {
-                "type": "object",
-                "properties": {
-                    "conversation_summary": {"type": "string"},
-                    "subjective": {"type": "string"},
-                    "objective": {"type": "string"},
-                    "assessment": {"type": "string"},
-                    "plan": {"type": "string"},
-                    "key_insights": {"type": "string"},
-                    "admin_tasks": {"type": "array", "items": {"type": "string"}}
-                },
-                "required": ["conversation_summary", "subjective", "objective", "assessment", "plan", "key_insights", "admin_tasks"]
-            }
-        else:  # prescription
-            # Build context from SOAP note if available
-            soap_context_str = ""
-            if request.soap_context:
-                soap_context_str = f"""
+    else:  # prescription
+        soap_context_str = ""
+        if request.soap_context:
+            soap_context_str = f"""
 CLINICAL CONTEXT FROM SOAP NOTE:
-- Assessment: {request.soap_context.get('assessment', 'Not provided')}
-- Subjective findings: {request.soap_context.get('subjective', 'Not provided')}
-- Objective findings: {request.soap_context.get('objective', 'Not provided')}
-- Plan: {request.soap_context.get('plan', 'Not provided')}
-
-USE THIS CONTEXT to fill in diagnosis, symptoms, and chief complaint if they are not explicitly stated in the transcript.
+- Assessment: {request.soap_context.get('assessment', '')}
+- Subjective: {request.soap_context.get('subjective', '')}
+- Plan: {request.soap_context.get('plan', '')}
 """
-            
-            schema_prompt = f"""Generate a comprehensive prescription by extracting ALL clinical and medication information from the transcript.
+        
+        schema_prompt = f"""Generate a prescription. {soap_context_str}
 
-{soap_context_str}
-
-CRITICAL: You are a medical documentation assistant. Your job is to EXTRACT information from the conversation, NOT to prescribe medications.
-
-STEP 1: UNDERSTAND THE CLINICAL CONTEXT
-- First, identify the chief complaint and symptoms (use SOAP context if not in transcript)
-- Then, identify the diagnosis (use SOAP assessment if not explicitly stated in transcript)
-- Only THEN extract the medications that the doctor prescribed
-
-STEP 2: MEDICATION EXTRACTION RULES
-For EACH medication mentioned by the doctor, you MUST extract these 6 fields separately:
-1. name: EXACT medication name as stated by the doctor (generic or brand name)
-2. dose: Specific amount with units (e.g., "500mg", "10ml", "2 tablets", "1 puff")
-3. route: How to take it (e.g., "Oral", "Topical", "Inhalation", "IV", "IM", "Sublingual")
-4. frequency: How often (e.g., "Once daily", "Twice daily", "Three times daily", "Every 6 hours", "As needed")
-5. duration: How long (e.g., "7 days", "2 weeks", "30 days", "Until symptoms resolve", "Ongoing")
-6. instructions: Special instructions (e.g., "Take with food", "Before bedtime", "On empty stomach")
-
-⚠️ CRITICAL ANTI-HALLUCINATION RULE:
-- ONLY extract medications that the doctor EXPLICITLY prescribed in the conversation
-- DO NOT suggest or add medications based on the diagnosis or symptoms
-- DO NOT add "typical" or "standard" medications for the condition
-- If the doctor didn't prescribe any medications, return an empty medications list
-- Better to have NO medications than WRONG medications
-
-EXAMPLES:
-Doctor says: "Start amoxicillin 500 milligrams by mouth three times a day for one week, take with food"
-Extract as:
-- name: "Amoxicillin"
-- dose: "500mg"
-- route: "Oral"
-- frequency: "Three times daily"
-- duration: "7 days"
-- instructions: "Take with food"
-
-Doctor says: "Use the albuterol inhaler, two puffs as needed for shortness of breath"
-Extract as:
-- name: "Albuterol inhaler"
-- dose: "2 puffs"
-- route: "Inhalation"
-- frequency: "As needed"
-- duration: "Ongoing"
-- instructions: "For shortness of breath"
-
-Generate this EXACT JSON structure:
+Respond with ONLY this JSON structure:
 
 {{
   "patient_name": "{request.patient_name}",
   "patient_id": "{request.patient_id}",
-  
-  "chief_complaint": "Why the patient came in (e.g., 'Cough and fever for 3 days'). Leave empty if not mentioned.",
-  
-  "symptoms": ["List ALL symptoms mentioned", "Include duration if stated", "Leave empty list if none mentioned"],
-  
-  "diagnosis": "Primary diagnosis or working diagnosis as stated by doctor. Leave empty if not explicitly stated.",
-  
-  "vital_signs": {{
-    "blood_pressure": "e.g., 120/80",
-    "heart_rate": "e.g., 72 bpm",
-    "temperature": "e.g., 98.6°F",
-    "respiratory_rate": "e.g., 16",
-    "oxygen_saturation": "e.g., 98%",
-    "weight": "e.g., 70 kg"
-  }},
-  
+  "chief_complaint": "Why patient came in",
+  "symptoms": ["List of symptoms"],
+  "diagnosis": "Primary diagnosis",
+  "vital_signs": {{"blood_pressure": "", "heart_rate": "", "temperature": "", "respiratory_rate": "", "oxygen_saturation": "", "weight": ""}},
   "medications": [
-    {{
-      "name": "Medication name",
-      "dose": "Amount with units",
-      "route": "Administration route",
-      "frequency": "How often",
-      "duration": "How long",
-      "instructions": "Special instructions"
-    }}
+    {{"name": "Med name", "dose": "Amount", "route": "Oral/etc", "frequency": "How often", "duration": "How long", "instructions": "Special instructions"}}
   ],
-  
-  "instructions": "General patient care instructions, lifestyle modifications, what to do/avoid, when to take medications, etc. Leave empty if not discussed.",
-  
-  "warnings": ["Side effects to watch for", "When to seek immediate care", "Drug interactions mentioned", "Contraindications discussed"],
-  
-  "follow_up": "When to return for follow-up, what to monitor at home, when to call doctor. Leave empty if not discussed."
+  "instructions": "General care instructions",
+  "warnings": ["Side effects", "When to seek help"],
+  "follow_up": "Follow-up timeline"
 }}
 
-CRITICAL ANTI-HALLUCINATION RULES:
-- If a medication field is not mentioned, use empty string "" for that field
-- If vital signs not discussed, use empty strings for all vital sign fields
-- If no warnings discussed, use empty list []
-- Do NOT invent or assume standard medical information
-- Do NOT add typical dosing if not stated
-- Better to have incomplete data than fabricated data
-- Only extract what was EXPLICITLY said in the conversation"""
+ONLY extract medications the doctor EXPLICITLY prescribed. Use empty strings/lists if not mentioned."""
 
-            json_schema = {
-                "type": "object",
-                "properties": {
-                    "patient_name": {"type": "string"},
-                    "patient_id": {"type": "string"},
-                    "chief_complaint": {"type": "string"},
-                    "symptoms": {"type": "array", "items": {"type": "string"}},
-                    "diagnosis": {"type": "string"},
-                    "vital_signs": {
-                        "type": "object",
-                        "properties": {
-                            "blood_pressure": {"type": "string"},
-                            "heart_rate": {"type": "string"},
-                            "temperature": {"type": "string"},
-                            "respiratory_rate": {"type": "string"},
-                            "oxygen_saturation": {"type": "string"},
-                            "weight": {"type": "string"}
-                        }
-                    },
-                    "medications": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": {"type": "string"},
-                                "dose": {"type": "string"},
-                                "route": {"type": "string"},
-                                "frequency": {"type": "string"},
-                                "duration": {"type": "string"},
-                                "instructions": {"type": "string"}
-                            },
-                            "required": ["name", "dose", "route", "frequency", "duration"]
-                        }
-                    },
-                    "instructions": {"type": "string"},
-                    "warnings": {"type": "array", "items": {"type": "string"}},
-                    "follow_up": {"type": "string"}
-                },
-                "required": ["patient_name", "patient_id", "medications"]
-            }
-
-        # Prepare the full prompt
-        user_prompt = f"""
-Patient Context:
-- Name: {request.patient_name}
-- ID: {request.patient_id}  
-- Visit Type: {request.visit_type}
-- Note Type: {request.note_type.upper()}
+    user_prompt = f"""
+Patient: {request.patient_name} (ID: {request.patient_id})
+Visit Type: {request.visit_type}
 
 Transcript:
 {request.transcript}
 
 {schema_prompt}"""
 
-        # Call OpenAI GPT-4 for note generation
-        logger.info("Calling OpenAI GPT-4 for note generation...")
-        
-        completion = openai_client.chat.completions.create(
-            model="gpt-4o-mini",  # Cost-effective model for structured output
-            messages=[
-                {"role": "system", "content": guardrail_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            response_format={"type": "json_object"},  # Ensure JSON output
-            temperature=0.1,  # Low temperature for consistent, factual output - prevents hallucination
-            max_tokens=2000  # Increased limit for comprehensive clinical documentation
-        )
-        
-        # Extract and parse the generated JSON
-        generated_content = completion.choices[0].message.content
+    # Call Ollama
+    logger.info(f"Calling Ollama ({OLLAMA_MODEL}) for note generation...")
+    
+    messages = [
+        {"role": "system", "content": guardrail_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    
+    try:
+        generated_content = await call_ollama(messages, temperature=0.1)
         logger.info(f"Generated content length: {len(generated_content)} characters")
         
         try:
-            # Parse the JSON response
-            note_json = json.loads(generated_content)
+            note_json = extract_json_from_response(generated_content)
             logger.info("Successfully parsed generated JSON")
             
-            # Validate against our Pydantic models
+            # Validate and save to database
+            supabase = get_supabase_client()
+            
             if request.note_type == "soap":
                 validated_note = SOAPNote(**note_json)
-                return validated_note.model_dump()
-            else:
-                validated_note = PrescriptionNote(**note_json)
-                return validated_note.model_dump()
+                note_data = validated_note.model_dump()
                 
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON generated by AI: {e}")
-            # Retry once with more explicit instructions
-            retry_prompt = user_prompt + "\n\nIMPORTANT: Respond with valid JSON only, no additional text."
+                # Save SOAP note to database
+                db_result = supabase.table('soap_notes').insert({
+                    "patient_id": request.patient_id,
+                    "doctor_id": request.doctor_id,
+                    "conversation_id": request.conversation_id,
+                    "visit_type": request.visit_type,
+                    "conversation_summary": note_data["conversation_summary"],
+                    "subjective": note_data["subjective"],
+                    "objective": note_data["objective"],
+                    "assessment": note_data["assessment"],
+                    "plan": note_data["plan"],
+                    "key_insights": note_data["key_insights"],
+                    "admin_tasks": note_data["admin_tasks"]
+                }).execute()
+                
+                note_id = db_result.data[0]['id']
+                logger.info(f"Saved SOAP note: {note_id}")
+                
+                return {**note_data, "id": note_id, "note_type": "soap"}
             
-            retry_completion = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": guardrail_prompt},
-                    {"role": "user", "content": retry_prompt}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.1,
-                max_tokens=1500
-            )
+            else:  # prescription
+                validated_note = PrescriptionNote(**note_json)
+                note_data = validated_note.model_dump()
+                
+                # Save prescription to database
+                prescription_result = supabase.table('prescriptions').insert({
+                    "patient_id": request.patient_id,
+                    "doctor_id": request.doctor_id,
+                    "conversation_id": request.conversation_id,
+                    "chief_complaint": note_data["chief_complaint"],
+                    "symptoms": note_data["symptoms"],
+                    "diagnosis": note_data["diagnosis"],
+                    "vital_signs": note_data["vital_signs"],
+                    "instructions": note_data["instructions"],
+                    "warnings": note_data["warnings"],
+                    "follow_up": note_data["follow_up"]
+                }).execute()
+                
+                prescription_id = prescription_result.data[0]['id']
+                logger.info(f"Saved prescription: {prescription_id}")
+                
+                # Save medications
+                for med in note_data["medications"]:
+                    supabase.table('medications').insert({
+                        "prescription_id": prescription_id,
+                        "name": med["name"],
+                        "dose": med["dose"],
+                        "route": med["route"],
+                        "frequency": med["frequency"],
+                        "duration": med["duration"],
+                        "instructions": med.get("instructions", "")
+                    }).execute()
+                
+                logger.info(f"Saved {len(note_data['medications'])} medications")
+                
+                return {**note_data, "id": prescription_id, "note_type": "prescription"}
+                
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"Invalid JSON generated: {e}")
+            # Retry once
+            retry_prompt = user_prompt + "\n\nIMPORTANT: Respond with valid JSON only."
+            retry_content = await call_ollama([
+                {"role": "system", "content": guardrail_prompt},
+                {"role": "user", "content": retry_prompt}
+            ], temperature=0.05)
             
-            retry_content = retry_completion.choices[0].message.content
             try:
-                note_json = json.loads(retry_content)
+                note_json = extract_json_from_response(retry_content)
                 if request.note_type == "soap":
                     validated_note = SOAPNote(**note_json)
                     return validated_note.model_dump()
                 else:
                     validated_note = PrescriptionNote(**note_json)
                     return validated_note.model_dump()
-            except (json.JSONDecodeError, ValidationError) as retry_error:
-                logger.error(f"Retry also failed: {retry_error}")
-                raise HTTPException(
-                    status_code=500,
-                    detail="AI failed to generate valid structured note. Please try again."
-                )
+            except Exception as retry_error:
+                logger.error(f"Retry failed: {retry_error}")
+                raise HTTPException(status_code=500, detail="AI failed to generate valid note. Please try again.")
         
         except ValidationError as e:
-            logger.error(f"Generated JSON doesn't match schema: {e}")
-            raise HTTPException(
-                status_code=500,
-                detail="Generated note doesn't match required format. Please try again."
-            )
+            logger.error(f"Schema validation error: {e}")
+            raise HTTPException(status_code=500, detail="Generated note doesn't match required format.")
             
-    except openai.OpenAIError as e:
-        logger.error(f"OpenAI API error during summarization: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"AI service error: {str(e)}"
-        )
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Unexpected error during summarization: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail="Internal server error during note generation"
-        )
+        logger.error(f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error during note generation")
 
+
+# ============== History Endpoints ==============
+
+@app.get("/api/soap-notes/{note_id}")
+async def get_soap_note(note_id: str) -> Dict[str, Any]:
+    """Get a specific SOAP note."""
+    try:
+        supabase = get_supabase_client()
+        result = supabase.table('soap_notes').select('*').eq('id', note_id).execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=404, detail="SOAP note not found")
+        
+        return result.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/soap-notes")
+async def list_soap_notes(
+    patient_id: str = Query(None),
+    doctor_id: str = Query(None),
+    limit: int = Query(20, le=100)
+) -> List[Dict[str, Any]]:
+    """List SOAP notes with optional filtering."""
+    try:
+        supabase = get_supabase_client()
+        query = supabase.table('soap_notes').select('*')
+        
+        if patient_id:
+            query = query.eq('patient_id', patient_id)
+        if doctor_id:
+            query = query.eq('doctor_id', doctor_id)
+        
+        result = query.order('created_at', desc=True).limit(limit).execute()
+        return result.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/prescriptions/{prescription_id}")
+async def get_prescription(prescription_id: str) -> Dict[str, Any]:
+    """Get a specific prescription with medications."""
+    try:
+        supabase = get_supabase_client()
+        
+        # Get prescription
+        prescription = supabase.table('prescriptions').select('*').eq('id', prescription_id).execute()
+        if not prescription.data:
+            raise HTTPException(status_code=404, detail="Prescription not found")
+        
+        # Get medications
+        medications = supabase.table('medications').select('*').eq('prescription_id', prescription_id).execute()
+        
+        return {
+            **prescription.data[0],
+            "medications": medications.data
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/prescriptions")
+async def list_prescriptions(
+    patient_id: str = Query(None),
+    doctor_id: str = Query(None),
+    limit: int = Query(20, le=100)
+) -> List[Dict[str, Any]]:
+    """List prescriptions with optional filtering."""
+    try:
+        supabase = get_supabase_client()
+        query = supabase.table('prescriptions').select('*')
+        
+        if patient_id:
+            query = query.eq('patient_id', patient_id)
+        if doctor_id:
+            query = query.eq('doctor_id', doctor_id)
+        
+        result = query.order('created_at', desc=True).limit(limit).execute()
+        return result.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/conversations")
+async def list_conversations(
+    patient_id: str = Query(None),
+    doctor_id: str = Query(None),
+    limit: int = Query(20, le=100)
+) -> List[Dict[str, Any]]:
+    """List conversations/transcripts."""
+    try:
+        supabase = get_supabase_client()
+        query = supabase.table('conversations').select('*')
+        
+        if patient_id:
+            query = query.eq('patient_id', patient_id)
+        if doctor_id:
+            query = query.eq('doctor_id', doctor_id)
+        
+        result = query.order('created_at', desc=True).limit(limit).execute()
+        return result.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============== Render Endpoint ==============
 
 @app.post("/api/render")
 async def render_note(request: RenderRequest) -> HTMLResponse:
-    """
-    Render structured note as printable HTML using Jinja2 templates.
-    
-    This endpoint:
-    1. Validates note type and data structure
-    2. Loads appropriate Jinja2 template (soap.html or prescription.html)
-    3. Renders template with note data and patient context
-    4. Returns HTML ready for printing/PDF generation
-    5. Includes print-specific CSS and medical disclaimers
-    
-    Args:
-        request: RenderRequest with note type, data, and patient context
-        
-    Returns:
-        HTMLResponse with rendered template
-        
-    Raises:
-        HTTPException: If note type is invalid or template rendering fails
-    """
-    # Validate note type
+    """Render structured note as printable HTML."""
     if request.note_type not in ["soap", "prescription"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Note type must be 'soap' or 'prescription'"
-        )
+        raise HTTPException(status_code=400, detail="Note type must be 'soap' or 'prescription'")
     
-    # Validate note data is not empty
     if not request.note_data:
-        raise HTTPException(
-            status_code=400,
-            detail="Note data cannot be empty"
-        )
+        raise HTTPException(status_code=400, detail="Note data cannot be empty")
     
     logger.info(f"Rendering {request.note_type} note for patient {request.patient_id}")
     
     try:
-        # Select appropriate template
         template_name = f"{request.note_type}.html"
         template = jinja_env.get_template(template_name)
         
-        # Prepare template context
         template_context = {
             "note": request.note_data,
             "patient_name": request.patient_name,
@@ -728,18 +843,14 @@ async def render_note(request: RenderRequest) -> HTMLResponse:
             "current_time": datetime.now().strftime("%I:%M %p")
         }
         
-        # Render the template
         rendered_html = template.render(**template_context)
         
-        logger.info(f"Successfully rendered {request.note_type} template")
-        
-        # Return HTML response with proper content type
         return HTMLResponse(
             content=rendered_html,
             status_code=200,
             headers={
                 "Content-Type": "text/html; charset=utf-8",
-                "Cache-Control": "no-cache, no-store, must-revalidate",  # Don't cache medical documents
+                "Cache-Control": "no-cache, no-store, must-revalidate",
                 "Pragma": "no-cache",
                 "Expires": "0"
             }
@@ -747,10 +858,8 @@ async def render_note(request: RenderRequest) -> HTMLResponse:
         
     except Exception as e:
         logger.error(f"Error rendering template: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to render note template: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to render note template: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn
