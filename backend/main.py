@@ -585,25 +585,61 @@ CLINICAL CONTEXT FROM SOAP NOTE:
 - Plan: {request.soap_context.get('plan', '')}
 """
         
-        schema_prompt = f"""Generate a prescription. {soap_context_str}
+        schema_prompt = f"""Generate a detailed medical prescription based on the consultation transcript. {soap_context_str}
 
 Respond with ONLY this JSON structure:
 
 {{
-  
-  "chief_complaint": "Why patient came in",
-  "symptoms": ["List of symptoms"],
-  "diagnosis": "Primary diagnosis",
-  "vital_signs": {{"blood_pressure": "", "heart_rate": "", "temperature": "", "respiratory_rate": "", "oxygen_saturation": "", "weight": ""}},
+  "chief_complaint": "Primary reason for visit (single text string)",
+  "symptoms": ["symptom1", "symptom2", "symptom3"],
+  "diagnosis": "Primary medical diagnosis based on consultation",
+  "vital_signs": {{
+    "blood_pressure": "e.g., 120/80 mmHg",
+    "heart_rate": "e.g., 72 bpm",
+    "temperature": "e.g., 98.6°F or 37°C",
+    "respiratory_rate": "e.g., 16 breaths/min",
+    "oxygen_saturation": "e.g., 98%",
+    "weight": "e.g., 70 kg"
+  }},
   "medications": [
-    {{"name": "Med name", "dose": "Amount", "route": "Oral/etc", "frequency": "How often", "duration": "How long", "instructions": "Special instructions"}}
+    {{
+      "name": "Full medication name (brand or generic)",
+      "dose": "Specific dosage with unit (e.g., 500mg, 10ml)",
+      "route": "Administration route (Oral, IV, Topical, etc.)",
+      "frequency": "How often (e.g., Twice daily, Every 8 hours, As needed)",
+      "duration": "Treatment duration (e.g., 7 days, 2 weeks, Until symptoms resolve)",
+      "instructions": "Detailed patient instructions (e.g., Take with food, Avoid alcohol, Take before bedtime)"
+    }}
   ],
-  "instructions": "General care instructions",
-  "warnings": ["Side effects", "When to seek help"],
-  "follow_up": "Follow-up timeline"
+  "instructions": "General patient care instructions and lifestyle recommendations",
+  "warnings": [
+    "Important side effects to watch for",
+    "When to seek immediate medical attention",
+    "Drug interactions or contraindications"
+  ],
+  "follow_up": "Follow-up timeline and what to monitor (e.g., Return in 2 weeks for re-evaluation)"
 }}
 
-ONLY extract medications the doctor EXPLICITLY prescribed. Use empty strings/lists if not mentioned."""
+CRITICAL EXTRACTION RULES:
+1. ONLY extract information EXPLICITLY mentioned in the transcript
+2. For medications: Include ONLY drugs the doctor specifically prescribed
+3. If vital signs weren't mentioned, use empty strings: ""
+4. If no warnings discussed, use empty list: []
+5. Dosage must include units (mg, ml, tablets, etc.)
+6. Frequency must be clear (times per day, specific intervals)
+7. Duration must specify time period (days, weeks, until condition improves)
+8. Instructions should be patient-friendly and actionable
+
+QUALITY STANDARDS FOR MEDICATIONS:
+- Name: Use exact drug name mentioned by doctor
+- Dose: Must include measurement unit (500mg, NOT just "500")
+- Route: Standard medical terms (Oral, Intravenous, Subcutaneous, Topical, Inhalation)
+- Frequency: Be specific (Twice daily, Every 6 hours, Before meals, At bedtime)
+- Duration: Clear timeframe (7 days, 2 weeks, 1 month, As needed for up to 14 days)
+- Instructions: Practical guidance (Take with full glass of water, Avoid dairy products, May cause drowsiness)
+
+If no medications were prescribed, use empty array: []
+If information is missing, use empty strings "" or empty arrays [], DO NOT invent or assume."""
 
     user_prompt = f"""
 Patient: {request.patient_name} (ID: {request.patient_id})

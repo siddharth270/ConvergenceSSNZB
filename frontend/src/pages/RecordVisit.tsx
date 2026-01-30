@@ -7,9 +7,10 @@ import PatientSelector from '../components/patients/PatientSelector';
 import { useAuthStore } from '../store/authStore';
 import { usePatientStore } from '../store/patientStore';
 import { api } from '../services/api';
-import { NoteType, VisitType } from '../types';
+import { NoteType, VisitType, SOAPNote, Prescription } from '../types';
+import PrescriptionSuccess from '../components/notes/PrescriptionSuccess';
 
-type WorkflowStep = 'select-patient' | 'recording' | 'transcription' | 'processing';
+type WorkflowStep = 'select-patient' | 'recording' | 'transcription' | 'processing' | 'note-success';
 
 export default function RecordVisit() {
   const navigate = useNavigate();
@@ -21,6 +22,7 @@ export default function RecordVisit() {
   const [visitType, setVisitType] = useState<VisitType>('followup');
   const [transcript, setTranscript] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
+  const [generatedNote, setGeneratedNote] = useState<SOAPNote | Prescription | null>(null);
 
   const handleRecordingComplete = async (blob: Blob) => {
     if (!selectedPatient || !doctor) {
@@ -68,10 +70,8 @@ export default function RecordVisit() {
       });
 
       toast.success(`${noteType.toUpperCase()} note generated!`, { id: loadingToast });
-      toast.success('Note saved to database!');
-      
-      // Navigate back to dashboard
-      setTimeout(() => navigate('/dashboard'), 1500);
+      setGeneratedNote(result);
+      setCurrentStep('note-success');
     } catch (error: any) {
       console.error('Note generation error:', error);
       toast.error(error.response?.data?.detail || 'Failed to generate note', { 
@@ -250,6 +250,35 @@ export default function RecordVisit() {
                 {isProcessing ? 'Generating...' : `Generate ${noteType.toUpperCase()} Note`}
               </button>
             </div>
+          </div>
+        )}
+
+                {/* Step 5: Success with Prescription Inventory */}
+        {currentStep === 'note-success' && generatedNote && (
+          <div className="space-y-6">
+            {noteType === 'prescription' ? (
+              <PrescriptionSuccess
+                prescription={generatedNote as Prescription}
+                patientName={selectedPatient!.name}
+                doctorName={doctor!.name}
+              />
+            ) : (
+              <div className="card text-center py-12">
+                <div className="text-6xl mb-4">✅</div>
+                <h2 className="text-2xl font-bold text-gray-900 mb-2">
+                  SOAP Note Saved Successfully!
+                </h2>
+                <p className="text-gray-600 mb-6">
+                  Your clinical documentation has been saved to the database.
+                </p>
+                <button
+                  onClick={() => navigate('/dashboard')}
+                  className="btn-primary"
+                >
+                  Back to Dashboard
+                </button>
+              </div>
+            )}
           </div>
         )}
       </div>

@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../store/authStore';
 import { usePatientStore } from '../store/patientStore';
 import { api } from '../services/api';
-import { ArrowLeft, Plus, Search, User, Calendar, Phone, Mail } from 'lucide-react';
+import { ArrowLeft, Plus, Search, User, Calendar, Phone, Mail, Eye } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { Patient } from '../types';
 
@@ -15,6 +15,7 @@ export default function PatientList() {
   const [searchQuery, setSearchQuery] = useState('');
   const [showAddForm, setShowAddForm] = useState(false);
   const [selectedPatient, setSelectedPatient] = useState<Patient | null>(null);
+  const [viewingNote, setViewingNote] = useState<any>(null);
   const [newPatient, setNewPatient] = useState({
     name: '',
     date_of_birth: '',
@@ -404,21 +405,53 @@ export default function PatientList() {
                   )}
 
                   <div className="pt-4 border-t">
-                    <h4 className="text-sm font-semibold text-gray-700 mb-2">Recent Notes</h4>
-                    {selectedPatient.recent_soap_notes && selectedPatient.recent_soap_notes.length > 0 ? (
-                      <div className="space-y-2">
-                        {selectedPatient.recent_soap_notes.slice(0, 3).map((note) => (
-                          <div key={note.id} className="text-sm bg-gray-50 p-2 rounded">
-                            <p className="font-medium text-gray-900">
-                              {note.visit_type} - {new Date(note.created_at!).toLocaleDateString()}
-                            </p>
-                          </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <p className="text-sm text-gray-500">No notes yet</p>
-                    )}
-                  </div>
+  <h4 className="text-sm font-semibold text-gray-700 mb-3">📋 Recent Notes</h4>
+  {selectedPatient.recent_soap_notes && selectedPatient.recent_soap_notes.length > 0 ? (
+    <div className="space-y-3">
+      {selectedPatient.recent_soap_notes.slice(0, 5).map((note) => (
+        <div 
+          key={note.id} 
+          className="bg-white border border-gray-200 rounded-lg p-3 hover:border-primary-300 transition-colors"
+        >
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-2">
+              <span className="bg-primary-100 text-primary-700 px-2 py-1 rounded text-xs font-semibold">
+                {note.visit_type?.toUpperCase()}
+              </span>
+              <span className="text-xs text-gray-500">
+                {new Date(note.created_at!).toLocaleDateString()}
+              </span>
+            </div>
+            <button
+              onClick={() => setViewingNote(note)}
+              className="text-primary-600 hover:text-primary-700 p-1"
+            >
+              <Eye className="w-4 h-4" />
+            </button>
+          </div>
+          
+          <div className="space-y-1">
+            {note.conversation_summary && (
+              <p className="text-xs text-gray-600 line-clamp-1">
+                <span className="font-semibold">Summary:</span> {note.conversation_summary}
+              </p>
+            )}
+            <p className="text-sm text-gray-700 line-clamp-2">
+              <span className="font-semibold">Assessment:</span> {note.assessment || 'N/A'}
+            </p>
+            <p className="text-xs text-gray-600 line-clamp-1">
+              <span className="font-semibold">Plan:</span> {note.plan || 'N/A'}
+            </p>
+          </div>
+        </div>
+      ))}
+    </div>
+  ) : (
+    <div className="text-center py-6 bg-gray-50 rounded-lg border-2 border-dashed border-gray-200">
+      <p className="text-sm text-gray-500">No notes yet</p>
+    </div>
+  )}
+</div>
                 </div>
               </div>
             ) : (
@@ -430,6 +463,114 @@ export default function PatientList() {
           </div>
         </div>
       </div>
+      {/* SOAP Note Modal */}
+      {viewingNote && (
+        <div 
+          className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4"
+          onClick={() => setViewingNote(null)}
+        >
+          <div 
+            className="bg-white rounded-lg max-w-2xl w-full max-h-[90vh] overflow-y-auto p-6"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between mb-4 pb-4 border-b">
+              <h2 className="text-xl font-bold text-gray-900">SOAP Note Details</h2>
+              <button
+                onClick={() => setViewingNote(null)}
+                className="text-gray-400 hover:text-gray-600 text-3xl leading-none"
+              >
+                ×
+              </button>
+            </div>
+            
+            <div className="space-y-4">
+              {viewingNote.conversation_summary && (
+                <div>
+                  <h3 className="text-sm font-semibold text-gray-700 mb-2">📋 Summary</h3>
+                  <p className="text-sm text-gray-600 bg-blue-50 p-3 rounded border border-blue-200">
+                    {viewingNote.conversation_summary}
+                  </p>
+                </div>
+              )}
+              
+              <div>
+                <h3 className="text-sm font-semibold text-gray-700 mb-2">
+                  <span className="bg-green-100 text-green-800 px-2 py-1 rounded text-xs font-bold mr-2">S</span>
+                  Subjective
+                </h3>
+                <p className="text-sm text-gray-600 bg-gray-50 p-3 rounded border-l-4 border-green-500">
+                  {viewingNote.subjective || 'N/A'}
+                </p>
+              </div>
+              
+              <div>
+                <h3 className="text-sm font-semibold text-gray-700 mb-2">
+                  <span className="bg-blue-100 text-blue-800 px-2 py-1 rounded text-xs font-bold mr-2">O</span>
+                  Objective
+                </h3>
+                <p className="text-sm text-gray-600 bg-gray-50 p-3 rounded border-l-4 border-blue-500">
+                  {viewingNote.objective || 'N/A'}
+                </p>
+              </div>
+              
+              <div>
+                <h3 className="text-sm font-semibold text-gray-700 mb-2">
+                  <span className="bg-amber-100 text-amber-800 px-2 py-1 rounded text-xs font-bold mr-2">A</span>
+                  Assessment
+                </h3>
+                <p className="text-sm text-gray-600 bg-gray-50 p-3 rounded border-l-4 border-amber-500">
+                  {viewingNote.assessment || 'N/A'}
+                </p>
+              </div>
+              
+              <div>
+                <h3 className="text-sm font-semibold text-gray-700 mb-2">
+                  <span className="bg-purple-100 text-purple-800 px-2 py-1 rounded text-xs font-bold mr-2">P</span>
+                  Plan
+                </h3>
+                <p className="text-sm text-gray-600 bg-gray-50 p-3 rounded border-l-4 border-purple-500">
+                  {viewingNote.plan || 'N/A'}
+                </p>
+              </div>
+              
+              {viewingNote.key_insights && (
+                <div>
+                  <h3 className="text-sm font-semibold text-gray-700 mb-2">💡 Key Insights</h3>
+                  <p className="text-sm text-gray-600 bg-yellow-50 p-3 rounded border border-yellow-200">
+                    {viewingNote.key_insights}
+                  </p>
+                </div>
+              )}
+              
+              {(() => {
+                try {
+                  const tasks = typeof viewingNote.admin_tasks === 'string' 
+                    ? JSON.parse(viewingNote.admin_tasks) 
+                    : viewingNote.admin_tasks;
+                  if (tasks && Array.isArray(tasks) && tasks.length > 0) {
+                    return (
+                      <div>
+                        <h3 className="text-sm font-semibold text-gray-700 mb-2">✅ Admin Tasks</h3>
+                        <ul className="text-sm text-gray-600 bg-gray-50 p-3 rounded space-y-2">
+                          {tasks.map((task: string, idx: number) => (
+                            <li key={idx} className="flex items-start gap-2">
+                              <span className="text-primary-500 font-bold">•</span>
+                              <span>{task}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    );
+                  }
+                } catch (e) {
+                  console.error('Error parsing admin_tasks:', e);
+                }
+                return null;
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
